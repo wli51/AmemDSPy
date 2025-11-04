@@ -1,9 +1,15 @@
-import json
+"""
+memory_system.py
+
+Core memory system.
+"""
+
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Literal, FrozenSet
 
 from .retrievers import ChromaRetriever
 from .memory_note import MemoryNote
+from .memory_index import MemoryIndex
 
 
 class AgenticMemorySystem:
@@ -29,6 +35,10 @@ class AgenticMemorySystem:
         :param kwargs: Additional args for ChromaRetriever
         """
         self.memories: Dict[str, MemoryNote] = {}
+        # keyword index to memory ID mapping cache for faster lookup
+        self.kw_index = MemoryIndex()
+        # self._index_to_id: Dict[FrozenSet[Tuple[str, str]], str] = {}
+        # self._kv_to_ids: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
         
         # Initialize ChromaDB retriever
         if retriever is None:
@@ -59,154 +69,158 @@ class AgenticMemorySystem:
         Called during initialization to sync in-memory state with ChromaDB.
         """
         try:
-            # Get all documents from the collection
-            all_data = self.retriever.collection.get(
-                include=["metadatas", "documents"]
-            )
-            
-            if not all_data or not all_data.get('ids'):
+            all_data = self.retriever.collection.get(include=["metadatas", "documents"])
+            if not all_data or not all_data.get("ids"):
                 return
-            
-            # Deserialize metadata using field registry
+
             if all_data.get("metadatas"):
                 all_data["metadatas"] = self.retriever._deserialize_metadatas(
                     [all_data["metadatas"]]
                 )[0]
-            
-            # Reconstruct MemoryNote objects
+
+            # bucket by exact canonical index to collapse legacy duplicates
+            buckets: Dict[FrozenSet[Tuple[str, str]], List[str]] = {}
+
             for doc_id, content, metadata in zip(
-                all_data['ids'], 
-                all_data['documents'], 
-                all_data['metadatas']
+                all_data["ids"], all_data["documents"], all_data["metadatas"]
             ):
-                # Ensure content is in metadata
-                if 'content' not in metadata:
-                    metadata['content'] = content
-                if 'id' not in metadata:
-                    metadata['id'] = doc_id
-                    
+                if "content" not in metadata:
+                    metadata["content"] = content
+                if "id" not in metadata:
+                    metadata["id"] = doc_id
+
                 note = MemoryNote.deserialize_from_storage(metadata)
                 self.memories[doc_id] = note
-                
+
+                extras = getattr(note, "extras", None)
+                self.kw_index.add_bucket_candidate(doc_id, extras)
+
+            def _resolve_dup(ids: List[str]) -> str:
+                def _score(_id: str):
+                    n = self.memories[_id]
+                    ts = getattr(n, "timestamp", "") or ""
+                    la = getattr(n, "last_accessed", None)
+                    la_ts = int(la.timestamp()) if la and hasattr(la, "timestamp") else 0
+                    rc = getattr(n, "retrieval_count", 0) or 0
+                    return (ts, la_ts, rc)
+                return sorted(ids, key=_score, reverse=True)[0]
+
+            self.kw_index.finalize_buckets(_resolve_dup)
+
         except AttributeError:
-            # Collection may not exist yet - this is fine for new systems
             pass
         except Exception as e:
-            # For unexpected errors, warn but don't crash
             import warnings
             warnings.warn(
-                f"Failed to load existing memories from retriever: {e}",
-                RuntimeWarning
+                f"Failed to load memories or build index cache: {e}", RuntimeWarning
             )
-
-    def add_note(
-        self, 
-        content: str, 
-        **kwargs
-    ) -> str:
-        """Add a new memory note to the system.
-        
-        :param kwargs: Additional metadata fields, which can include:
-        :param keywords: Key terms extracted from the content
-        :param tags: Additional classification tags
-        
-        :return: The unique ID of the created memory note
-        """
-        # Create MemoryNote (it will automatically handle extras)
-        note = MemoryNote(content=content, **kwargs)
-        
-        # Store in local dictionary
-        self.memories[note.id] = note
-        
-        # Add to ChromaDB with serialized metadata
-        self.retriever.add_document(
-            document=note.content, 
-            metadata=note.serialize_for_storage(), 
-            doc_id=note.id
-        )
-        
-        return note.id
     
     def read(self, memory_id: str) -> Optional[MemoryNote]:
-        """Retrieve a memory note by its ID.
-        
-        :param memory_id: ID of the memory to retrieve
-        :return: MemoryNote instance or None if not found
-        """
         memory = self.memories.get(memory_id)
         if memory:
-            # Update access tracking
             memory.last_accessed = datetime.now(timezone.utc)
             memory.retrieval_count += 1
         return memory
     
-    def search(
+    def semantic_search(
         self,
         query: str,
         k: int = 5,
-        _threshold: float = 0.7,
+        threshold: float = 0.7,
     ) -> List[Dict[str, Any]]:
         """
-        Perform a semantic search for memory notes similar to the query.
-
-        :param query: The search query string
-        :param k: Number of top results to return
-        :param _threshold: Similarity threshold
+        Pure embedding-based semantic search via retriever.
+        Returns a list of dicts:
+          - if memory is known locally: MemoryNote.model_dump()
+          - otherwise: {"id": <id>, "content": <text>} as a lightweight stub
         """
-
-        results_list = []
-        
-        # semantic search
+        results_list: List[Dict[str, Any]] = []
         results = self.retriever.search(query, k)
-        
-        if results and results.get('ids'):
-            # Get IDs already included from keyword filtering
-            existing_ids = {r['id'] for r in results_list}
-            
-            # Add semantic search results that aren't already included
-            for id, content, distance in zip(
-                results['ids'][0], 
-                results['documents'][0],
-                results['distances'][0]
+        if results and results.get("ids"):
+            for id_, content, distance in zip(
+                results["ids"][0], results["documents"][0], results["distances"][0]
             ):
-                if id not in existing_ids and distance <= _threshold:
-                    if id in self.memories:
-                        results_list.append(self.memories[id].model_dump())
+                if distance <= threshold:
+                    if id_ in self.memories:
+                        results_list.append(self.memories[id_].model_dump())
                     else:
-                        results_list.append({"id": id, "content": content})
-
+                        results_list.append({"id": id_, "content": content})
         return results_list[:k]
-
-    def update(
-        self, 
-        memory_id: str, 
-        **kwargs
-    ) -> bool:
+    
+    def filter_by_index(
+        self,
+        index: Dict[str, str],
+        mode: Literal["exact", "subset", "any"] = "exact",
+        return_ids: bool = False,
+    ) -> List[Any]:
         """
-        Update a memory note's fields and synchronize with ChromaDB.
-        Only allows for update of fields defined in MemoryNote.
-        
-        :param memory_id: ID of the memory to update
-        :param kwargs: Fields to update with new values
+        Keyword-index filter ONLY (no embeddings).
+        - exact: full-key match -> at most one ID
+        - subset: partial match -> intersect per (k,v)
+        Returns MemoryNote objects by default, or IDs if return_ids=True.
         """
-        if memory_id not in self.memories:
-            return False        
+        if mode not in {"exact", "subset", "any"}:
+            raise ValueError("mode must be 'exact', 'subset' or 'any'")
 
-        # Update note fields
-        note = self.memories[memory_id]
-        try:
-            self.memories[memory_id].update(**kwargs)
-        except Exception:
-            return False
-        
-        # Sync update to ChromaDB
-        try:
-            self.retriever.collection.update(
-                ids=[memory_id], 
-                documents=[note.content], 
-                metadatas=[note.serialize_for_storage()]
+        if mode == "exact":
+            ids = self.kw_index.ids_by_exact_index(index)
+        elif mode == "subset":
+            ids = self.kw_index.ids_by_partial_index(index)
+        elif mode == "any":
+            ids = self.kw_index.ids_by_any_index(index)
+        else:
+            # should not reach here
+            pass
+
+        if return_ids:
+            return ids
+
+        # map to MemoryNotes (skip any dangling ids defensively)
+        return [self.memories[mid].model_dump() for mid in ids if mid in self.memories]
+    
+    def upsert(self, content: str, **index: str) -> str:
+        """
+        - Indexed: upsert(content, k1="v1", k2="v2", ...)
+                    updates existing or creates with deterministic id
+        - Non-indexed: upsert(content)  # creates a new free-form note (extras = {})
+        """
+        if index:
+            norm = MemoryIndex.normalize_index(index)
+
+            # update path
+            memo_id = self.kw_index.get_id_by_index(norm)
+            if memo_id:
+                note = self.memories[memo_id]
+                note.update(content=content, extras=norm)
+                self.retriever.collection.update(
+                    ids=[memo_id],
+                    documents=[note.content],
+                    metadatas=[note.serialize_for_storage()],
+                )
+                # caches already point at this id for this index
+                return memo_id
+
+            # create path (deterministic by default)
+            memo_id = MemoryIndex.deterministic_id_for_index(norm)
+            note = MemoryNote(id=memo_id, content=content, extras=norm)
+            memo_id = note.id
+            self.memories[memo_id] = note
+            self.kw_index.register_index(memo_id, norm)
+
+            self.retriever.add_document(
+                document=note.content,
+                metadata=note.serialize_for_storage(),
+                doc_id=memo_id,
             )
-        except Exception:
-            return False
-        
-        return True
+            return memo_id
+
+        # Non-indexed: always create new, extras = {}
+        note = MemoryNote(content=content, extras={})
+        memo_id = note.id
+        self.memories[memo_id] = note
+        self.retriever.add_document(
+            document=note.content,
+            metadata=note.serialize_for_storage(),
+            doc_id=memo_id,
+        )
+        return memo_id
